@@ -7,7 +7,7 @@ import { Suspense } from "react";
 function LoginContent() {
   const searchParams = useSearchParams();
   const error = searchParams.get("error");
-  const allowedDomainsLabel = "@zapply.nl and @codestrokes.com";
+  const allowedDomainsLabel = "@zapply.nl";
 
   async function signInWithGoogle() {
     const supabase = createClient();

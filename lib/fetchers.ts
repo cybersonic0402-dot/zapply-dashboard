@@ -192,6 +192,69 @@ export async function fetchShopifyMarkets() {
   return hasAnyLive ? results : null;
 }
 
+// Today's orders per market, bucketed by hour (Amsterdam time = UTC+2)
+export async function fetchShopifyToday() {
+  const clientId = process.env.SHOPIFY_APP_CLIENT_ID;
+  if (!clientId) return null;
+
+  const todayStart = `${today()}T00:00:00Z`;
+
+  const markets = await Promise.all(
+    SHOPIFY_STORES.map(async ({ code, flag, name, storeKey, status }: any) => {
+      const store = process.env[storeKey];
+      if (!store) return { code, flag, name, live: false };
+      const token = await getShopifyToken(store);
+      if (!token) return { code, flag, name, live: false };
+
+      try {
+        let revenue = 0, refunds = 0, orders = 0;
+        let currency = "EUR";
+        const hourlyRev: number[] = Array(24).fill(0);
+        const hourlyOrd: number[] = Array(24).fill(0);
+        let cursor: string | null = null;
+        let hasNextPage = true;
+        let page = 0;
+
+        while (hasNextPage && page < 5) {
+          const res: Response = await fetch(`https://${store}/admin/api/2025-01/graphql.json`, {
+            method: "POST",
+            headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
+            body: JSON.stringify({ query: SHOPIFY_GQL_PAGE(todayStart, cursor) }),
+            cache: "no-store",
+          });
+          if (!res.ok) break;
+          const json = await res.json();
+          if (json.errors) break;
+          const page_data = json.data?.orders ?? {};
+          const edges: any[] = page_data.edges ?? [];
+          hasNextPage = page_data.pageInfo?.hasNextPage ?? false;
+          cursor = page_data.pageInfo?.endCursor ?? null;
+          page++;
+
+          for (const { node: o } of edges) {
+            const r  = parseFloat(o.totalPriceSet.shopMoney.amount);
+            const rf = parseFloat(o.totalRefundedSet.shopMoney.amount);
+            revenue += r; refunds += rf; orders++;
+            currency = o.totalPriceSet.shopMoney.currencyCode;
+            // Amsterdam = UTC+2 (CEST, valid Apr-Oct)
+            const hour = (new Date(o.createdAt).getUTCHours() + 2) % 24;
+            hourlyRev[hour] += r;
+            hourlyOrd[hour]++;
+          }
+        }
+
+        const hourly = hourlyRev.map((rev, h) => ({ hour: h, revenue: +rev.toFixed(2), orders: hourlyOrd[h] }));
+        return { code, flag, name, revenue: +revenue.toFixed(2), refunds: +refunds.toFixed(2), orders, aov: orders > 0 ? +(revenue / orders).toFixed(2) : 0, currency, hourly, live: true };
+      } catch (err: any) {
+        console.error(`Shopify today ${code}:`, err.message);
+        return { code, flag, name, live: false };
+      }
+    })
+  );
+
+  return markets.some((m: any) => m.live) ? { markets, fetchedAt: new Date().toISOString() } : null;
+}
+
 // Last 6 months of order aggregates — NL store, fully paginated
 export async function fetchShopifyMonthly() {
   const store = process.env.SHOPIFY_NL_STORE;
@@ -309,77 +372,204 @@ export async function fetchTripleWhale() {
   return hasAnyLive ? results : null;
 }
 
-// ─── Loop Subscriptions ───────────────────────────────────────────────────────
+// ─── Juo Subscriptions (NL store) ────────────────────────────────────────────
+//
+// Base URL: https://api.juo.io/admin/v1
+// Auth: X-Juo-Admin-Api-Key header
+// Pagination: Link response header with rel="next" (cursor-based)
+// Fields: id, status (active|paused|canceled|failed|expired|merged),
+//         currencyCode, createdAt, canceledAt, nextBillingDate,
+//         items[].price, billingPolicy.interval, billingPolicy.intervalCount
+
+function normalizeToMonthly(price: number, interval: string, intervalCount: number): number {
+  const n = intervalCount || 1;
+  switch (interval) {
+    case "day":   return (price / n) * 30;
+    case "week":  return (price / n) * 4.33;
+    case "year":  return price / (n * 12);
+    default:      return price / n; // month
+  }
+}
+
+async function _fetchJuo() {
+  const apiKey = process.env.JUO_NL_API_KEY;
+  if (!apiKey) return null;
+
+  const JUO_BASE = "https://api.juo.io";
+  const headers  = { "X-Juo-Admin-Api-Key": apiKey, Accept: "application/json" };
+  const allSubs: any[] = [];
+  const MAX_PAGES = 100;
+  // Always build absolute URLs — Juo's Link header returns relative paths
+  let nextUrl: string | null = `${JUO_BASE}/admin/v1/subscriptions?limit=100`;
+  let page = 0;
+
+  try {
+    while (nextUrl && page < MAX_PAGES) {
+      const res: Response = await fetch(nextUrl, { headers, cache: "no-store" });
+
+      if (res.status === 429) {
+        const reset = parseInt(res.headers.get("X-RateLimit-Reset") ?? "2", 10);
+        await new Promise(r => setTimeout(r, (reset || 2) * 1000));
+        continue;
+      }
+      if (!res.ok) { console.error(`Juo API ${res.status}`); break; }
+
+      const json = await res.json();
+      const batch: any[] = json.data ?? json.subscriptions ?? (Array.isArray(json) ? json : []);
+      if (batch.length === 0) break;
+      allSubs.push(...batch);
+
+      // Follow Link header — Juo returns relative paths like </admin/v1/subscriptions?...>; rel="next"
+      const link: string = res.headers.get("Link") ?? "";
+      const m: RegExpMatchArray | null = link.match(/<([^>]+)>;\s*rel="next"/);
+      if (m) {
+        // Resolve relative or absolute href against JUO_BASE
+        const href = m[1];
+        nextUrl = href.startsWith("http") ? href : new URL(href, JUO_BASE).toString();
+      } else {
+        nextUrl = null;
+      }
+      page++;
+    }
+
+    if (!allSubs.length) return null;
+
+    const now        = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const activeSubs   = allSubs.filter(s => s.status === "active");
+    const pausedSubs   = allSubs.filter(s => s.status === "paused");
+    const canceledSubs = allSubs.filter(s => s.status === "canceled");
+
+    // MRR = sum of each active subscription's items, normalised to monthly
+    let mrr = 0;
+    for (const sub of activeSubs) {
+      const interval      = sub.billingPolicy?.interval ?? "month";
+      const intervalCount = sub.billingPolicy?.intervalCount ?? 1;
+      for (const item of sub.items ?? []) {
+        const price = parseFloat(item.price ?? item.unitPrice ?? "0");
+        mrr += normalizeToMonthly(price, interval, intervalCount);
+      }
+      // Add delivery price if billed to customer
+      if (sub.deliveryPrice > 0) {
+        mrr += normalizeToMonthly(parseFloat(sub.deliveryPrice), interval, intervalCount);
+      }
+    }
+
+    const newThisMonth     = allSubs.filter(s => s.createdAt && new Date(s.createdAt) >= monthStart).length;
+    const churnedThisMonth = canceledSubs.filter(s => s.canceledAt && new Date(s.canceledAt) >= monthStart).length;
+    const arpu             = activeSubs.length > 0 ? mrr / activeSubs.length : null;
+    const churnRate        = (activeSubs.length + churnedThisMonth) > 0
+      ? +((churnedThisMonth / (activeSubs.length + churnedThisMonth)) * 100).toFixed(1)
+      : null;
+
+    const currency = activeSubs[0]?.currencyCode ?? "EUR";
+
+    return [{
+      market: "NL", flag: "🇳🇱", platform: "juo", live: true,
+      mrr: +mrr.toFixed(2), activeSubs: activeSubs.length,
+      pausedSubs: pausedSubs.length, canceledSubs: canceledSubs.length,
+      totalFetched: allSubs.length, newThisMonth, churnedThisMonth,
+      arpu: arpu != null ? +arpu.toFixed(2) : null, churnRate, currency,
+    }];
+  } catch (err: any) {
+    console.error("Juo fetch error:", err.message);
+    return null;
+  }
+}
+
+// ─── Loop Subscriptions (UK · and future US/EU when keys added) ───────────────
 //
 // CONFIRMED WORKING — GET https://api.loopsubscriptions.com/admin/2023-10/subscription
 // Auth: X-Loop-Token header (NOT Bearer token)
 // Returns { success, message, data: [...subscriptions] }
 // Each subscription: { id, status, totalLineItemPrice, currencyCode, createdAt, cancelledAt, ... }
 
-export async function fetchLoop() {
-  const key = process.env.LOOP_UK_API_KEY;
-  if (!key) return null;
+const LOOP_STORES = [
+  { market: "UK", flag: "🇬🇧", envKey: "LOOP_UK_API_KEY" },
+  { market: "US", flag: "🇺🇸", envKey: "LOOP_US_API_KEY" },
+  { market: "EU", flag: "🇩🇪", envKey: "LOOP_EU_API_KEY" },
+] as const;
 
-  const BASE       = "https://api.loopsubscriptions.com";
-  const headers    = { "X-Loop-Token": key, Accept: "application/json" };
+async function fetchLoopStore(market: string, flag: string, key: string) {
+  const BASE    = "https://api.loopsubscriptions.com";
+  const headers = { "X-Loop-Token": key, Accept: "application/json" };
   const now        = new Date();
-  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
   const allSubs: any[] = [];
-  const MAX_PAGES = 60; // 60 × 50 = 3,000 subs max per cold fetch
+  const MAX_PAGES = 60;
+  let apiReached  = false; // true once we get at least one 200 response
 
-  try {
-    for (let page = 1; page <= MAX_PAGES; page++) {
-      // Retry once on 429 rate-limit before giving up
-      let res = await fetch(`${BASE}/admin/2023-10/subscription?limit=50&page=${page}`, {
-        headers,
-        next: { revalidate: 900 },
-      });
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    // Loop rate limit: ~1 req/s — wait 600ms between every page
+    if (page > 1) await new Promise(r => setTimeout(r, 600));
 
-      if (res.status === 429) {
-        await new Promise((r) => setTimeout(r, 1000));
-        res = await fetch(`${BASE}/admin/2023-10/subscription?limit=50&page=${page}`, { headers });
-      }
+    let res: Response = await fetch(`${BASE}/admin/2023-10/subscription?limit=50&page=${page}`, {
+      headers, cache: "no-store",
+    });
 
-      if (!res.ok) {
-        console.error(`Loop API page ${page} → ${res.status}`);
-        break;
-      }
-
-      const json = await res.json();
-      const batch: any[] = json.data ?? [];
-      allSubs.push(...batch);
-
-      if (!json.pageInfo?.hasNextPage || batch.length === 0) break;
+    // On 429: wait 15s and retry once — if still 429, stop gracefully with data collected so far
+    if (res.status === 429) {
+      await new Promise(r => setTimeout(r, 15000));
+      res = await fetch(`${BASE}/admin/2023-10/subscription?limit=50&page=${page}`, { headers, cache: "no-store" });
+    }
+    if (res.status === 429) {
+      console.warn(`Loop ${market}: rate-limited at page ${page}, returning ${allSubs.length} subs collected so far`);
+      break; // Return partial data — don't drop everything we've already fetched
     }
 
-    if (!allSubs.length) return null;
+    if (!res.ok) { console.error(`Loop ${market} page ${page} → ${res.status}`); break; }
 
-    const activeSubs       = allSubs.filter((s: any) => s.status === "ACTIVE");
-    const mrr              = activeSubs.reduce((sum: number, s: any) => sum + parseFloat(s.totalLineItemPrice ?? "0"), 0);
-    const newThisMonth     = allSubs.filter((s: any) => s.createdAt >= monthStart).length;
-    const churnedThisMonth = allSubs.filter((s: any) => s.status === "CANCELLED" && s.cancelledAt && s.cancelledAt >= monthStart).length;
-    const arpu             = activeSubs.length > 0 ? mrr / activeSubs.length : null;
-    const churnRate        = (activeSubs.length + churnedThisMonth) > 0
-      ? +((churnedThisMonth / (activeSubs.length + churnedThisMonth)) * 100).toFixed(1)
-      : null;
-
-    return [{
-      market:          "ALL",
-      flag:            "🌍",
-      live:            true,
-      mrr:             Math.round(mrr),
-      activeSubs:      activeSubs.length,
-      totalFetched:    allSubs.length,
-      newThisMonth,
-      churnedThisMonth,
-      arpu:            arpu != null ? +arpu.toFixed(2) : null,
-      churnRate,
-    }];
-  } catch (err: any) {
-    console.error("Loop fetch error:", err.message);
-    return null;
+    apiReached = true;
+    const json   = await res.json();
+    const batch: any[] = json.data ?? [];
+    allSubs.push(...batch);
+    if (!json.pageInfo?.hasNextPage || batch.length === 0) break;
   }
+
+  // Return null only if the API never responded (key invalid / network error)
+  if (!apiReached) return null;
+
+  const currency         = market === "US" ? "USD" : market === "UK" ? "GBP" : "EUR";
+  const activeSubs       = allSubs.filter(s => s.status === "ACTIVE");
+  const canceledSubs     = allSubs.filter(s => s.status === "CANCELLED");
+  const mrr              = activeSubs.reduce((sum, s) => sum + parseFloat(s.totalLineItemPrice ?? "0"), 0);
+  const newThisMonth     = allSubs.filter(s => s.createdAt && new Date(s.createdAt) >= monthStart).length;
+  const churnedThisMonth = canceledSubs.filter(s => s.cancelledAt && new Date(s.cancelledAt) >= monthStart).length;
+  const arpu             = activeSubs.length > 0 ? mrr / activeSubs.length : null;
+  const churnRate        = (activeSubs.length + churnedThisMonth) > 0
+    ? +((churnedThisMonth / (activeSubs.length + churnedThisMonth)) * 100).toFixed(1)
+    : null;
+
+  return {
+    market, flag, platform: "loop", live: true,
+    mrr: Math.round(mrr), activeSubs: activeSubs.length,
+    totalFetched: allSubs.length, newThisMonth, churnedThisMonth,
+    arpu: arpu != null ? +arpu.toFixed(2) : null, churnRate, currency,
+  };
 }
+
+async function _fetchLoop() {
+  // Each market has its own API key → its own rate-limit bucket → safe to run in parallel
+  const settled = await Promise.allSettled(
+    LOOP_STORES.map(({ market, flag, envKey }) => {
+      const key = process.env[envKey];
+      if (!key) return Promise.resolve(null);
+      return fetchLoopStore(market, flag, key);
+    })
+  );
+  const results = settled
+    .map(r => (r.status === "fulfilled" ? r.value : null))
+    .filter(Boolean);
+  return results.length > 0 ? results : null;
+}
+
+// Raw exports — called by /api/sync which writes results to Supabase data_cache
+export const fetchJuoRaw  = _fetchJuo;
+export const fetchLoopRaw = _fetchLoop;
+// Aliases for any legacy callers
+export const fetchJuo  = _fetchJuo;
+export const fetchLoop = _fetchLoop;
 
 // ─── Jortt ───────────────────────────────────────────────────────────────────
 //
@@ -420,7 +610,7 @@ async function getJorttToken(): Promise<string | null> {
         grant_type:    "client_credentials",
         client_id:     clientId,
         client_secret: clientSecret,
-        scope:         "invoices:read",
+        scope:         "invoices:read expenses:read reports:read",
       }).toString(),
       cache: "no-store",
     });
@@ -438,6 +628,12 @@ async function getJorttToken(): Promise<string | null> {
   }
 }
 
+function monthKey(dateStr: string): string {
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleDateString("en-US", { month: "short", year: "2-digit" }).replace(" ", " '");
+}
+
 export async function fetchJortt() {
   const token = await getJorttToken();
   if (!token) return null;
@@ -445,40 +641,115 @@ export async function fetchJortt() {
   const headers = { Authorization: `Bearer ${token}`, Accept: "application/json" };
   const BASE    = "https://api.jortt.nl";
 
+  // Date range: last 12 months
+  const since = new Date();
+  since.setMonth(since.getMonth() - 12);
+  const sinceStr = since.toISOString().split("T")[0];
+
   try {
-    // Fetch 3 pages × 100 invoices = up to 300 recent invoices (~6 months)
-    const pages = await Promise.all([1, 2, 3].map((page) =>
-      fetch(`${BASE}/invoices?per_page=100&page=${page}&invoice_status=sent`, {
-        headers,
-        next: { revalidate: 3600 },
-      })
-        .then((r) => r.ok ? r.json() : { data: [] })
-        .then((d) => d.data ?? [])
-    ));
-    const invoices: any[] = pages.flat();
+    // Fetch invoices, expenses, P&L summary, cash, and balance report in parallel
+    const [invoicePages, unpaidInvoices, expensePages, plRes, cashRes, balanceRes] = await Promise.all([
+      // Sent invoices (revenue) — /v1/invoices, 3 pages × 100
+      Promise.all([1, 2, 3].map(p =>
+        fetch(`${BASE}/v1/invoices?per_page=100&page=${p}&invoice_status=sent`, { headers, cache: "no-store" })
+          .then(r => {
+            if (!r.ok) { console.warn(`Jortt invoices p${p}: ${r.status}`); return []; }
+            return r.json().then(d => d.data ?? []);
+          })
+      )),
+      // Unpaid + late invoices → accounts receivable
+      fetch(`${BASE}/v1/invoices?per_page=100&page=1&invoice_status=unpaid`, { headers, cache: "no-store" })
+        .then(r => r.ok ? r.json().then(d => d.data ?? []) : []).catch(() => []),
+      // Expenses — needs expenses:read scope
+      Promise.all([1, 2].map(p =>
+        fetch(`${BASE}/v3/expenses?expense_type=cost&vat_date_from=${sinceStr}&per_page=100&page=${p}`, { headers, cache: "no-store" })
+          .then(r => {
+            if (!r.ok) { console.warn(`Jortt expenses p${p}: ${r.status} (add expenses:read scope in Jortt app settings)`); return []; }
+            return r.json().then(d => d.data ?? []);
+          })
+          .catch(() => [])
+      )),
+      // P&L summary — needs reports:read scope
+      fetch(`${BASE}/v1/reports/summaries/profit_and_loss`, { headers, cache: "no-store" })
+        .then(r => {
+          if (!r.ok) { console.warn(`Jortt P&L: ${r.status} (add reports:read scope in Jortt app settings)`); return null; }
+          return r.json();
+        }).catch(() => null),
+      // Cash & bank — needs reports:read scope
+      fetch(`${BASE}/v1/reports/summaries/cash_and_bank`, { headers, cache: "no-store" })
+        .then(r => {
+          if (!r.ok) { console.warn(`Jortt cash: ${r.status} (add reports:read scope in Jortt app settings)`); return null; }
+          return r.json();
+        }).catch(() => null),
+      // Balance report — needs reports:read scope
+      fetch(`${BASE}/v1/reports/summaries/balance`, { headers, cache: "no-store" })
+        .then(r => {
+          if (!r.ok) { console.warn(`Jortt balance: ${r.status} (add reports:read scope in Jortt app settings)`); return null; }
+          return r.json();
+        }).catch(() => null),
+    ]);
 
+    const invoices: any[]  = invoicePages.flat();
+    const expenses: any[]  = expensePages.flat();
+
+    // Accounts receivable = total outstanding unpaid invoices
+    const accountsReceivable = unpaidInvoices.reduce((sum: number, inv: any) => {
+      return sum + parseFloat(inv.invoice_total?.value ?? inv.total_amount?.value ?? "0");
+    }, 0);
+
+    // Revenue by month from invoices
     const revenueByMonth: Record<string, number> = {};
-
     for (const inv of invoices) {
-      const dateStr = inv.invoice_date ?? "";
-      if (!dateStr) continue;
-      const d = new Date(dateStr);
-      if (isNaN(d.getTime())) continue;
-
-      // invoice_total = excl. VAT (correct for B2B revenue reporting)
+      const mk = monthKey(inv.invoice_date ?? "");
+      if (!mk) continue;
       const total = parseFloat(inv.invoice_total?.value ?? "0");
-      if (total <= 0) continue;  // skip credit notes
-
-      const mk = d.toLocaleDateString("en-US", { month: "short", year: "2-digit" }).replace(" ", " '");
+      if (total <= 0) continue;
       revenueByMonth[mk] = (revenueByMonth[mk] ?? 0) + total;
     }
 
+    // Expenses by month from /v3/expenses
+    const expensesByMonth: Record<string, number> = {};
+    for (const exp of expenses) {
+      const mk = monthKey(exp.vat_date ?? exp.delivery_period ?? "");
+      if (!mk) continue;
+      // raw_total_amount is { value, currency }
+      const amt = parseFloat(
+        exp.raw_total_amount?.value ??
+        exp.total_amount?.value ??
+        exp.amount?.value ?? "0"
+      );
+      if (amt <= 0) continue;
+      expensesByMonth[mk] = (expensesByMonth[mk] ?? 0) + amt;
+    }
+
+    // Cash position from summary (best-effort)
+    const cashBalance: number | null = (() => {
+      if (!cashRes) return null;
+      const v = cashRes?.total_balance?.value ?? cashRes?.balance?.value ?? cashRes?.cash ?? null;
+      return v != null ? parseFloat(v) : null;
+    })();
+
+    // P&L totals from summary (best-effort)
+    const plSummary = plRes ? {
+      revenue:    parseFloat(plRes?.revenue?.value      ?? plRes?.turnover?.value     ?? "0"),
+      costs:      parseFloat(plRes?.costs?.value        ?? plRes?.expenses?.value     ?? "0"),
+      grossProfit: parseFloat(plRes?.gross_profit?.value ?? plRes?.net_result?.value  ?? "0"),
+    } : null;
+
     return {
-      opexByMonth:  [],    // purchase invoices need broader scope — out of scope for now
-      opexDetail:   {},
       revenueByMonth,
-      invoiceCount: invoices.filter((i: any) => parseFloat(i.invoice_total?.value ?? "0") > 0).length,
+      expensesByMonth,
+      cashBalance,
+      plSummary,
+      balanceReport: balanceRes,
+      accountsReceivable: accountsReceivable > 0 ? accountsReceivable : null,
+      unpaidInvoiceCount: unpaidInvoices.length,
+      invoiceCount: invoices.filter(i => parseFloat(i.invoice_total?.value ?? "0") > 0).length,
+      expenseCount: expenses.length,
       live: Object.keys(revenueByMonth).length > 0,
+      // Legacy fields (keep for compatibility)
+      opexByMonth: [],
+      opexDetail:  {},
     };
   } catch (err: any) {
     console.error("Jortt fetch error:", err.message);
