@@ -297,25 +297,25 @@ const OverviewView = ({ range, setRange, data = [], totals, liveMarkets = null, 
           icon: Sparkles,
           label: "Contribution margin",
           value: `€${Math.round(liveRevenueMTD * 0.42).toLocaleString()}`,
-          delta: "9.4%",
+          delta: null,
           positive: true,
-          sub: `${(((liveRevenueMTD * 0.42) / liveRevenueMTD) * 100).toFixed(1)}% of revenue`,
+          sub: `~42% of revenue · est. pending Jortt/Xero OpEx`,
         },
         {
           icon: Wallet,
           label: "OpEx",
           value: `€${Math.round(liveRevenueMTD * 0.18).toLocaleString()}`,
-          delta: "2.8%",
+          delta: null,
           positive: false,
-          sub: "Team, software, agencies, other",
+          sub: `~18% of revenue · est. — enable Jortt purchase scope`,
         },
         {
           icon: TrendingUp,
           label: "EBITDA",
           value: `€${Math.round(liveRevenueMTD * 0.25).toLocaleString()}`,
-          delta: "8.1%",
+          delta: null,
           positive: true,
-          sub: `Margin ${((liveRevenueMTD * 0.25 / liveRevenueMTD) * 100).toFixed(1)}%`,
+          sub: `~25% margin · est. pending real OpEx data`,
         },
       ].map((s) => (
         <Card key={s.label} className="p-5 transition hover:border-neutral-300">
@@ -324,10 +324,12 @@ const OverviewView = ({ range, setRange, data = [], totals, liveMarkets = null, 
               <s.icon size={14} />
               <span>{s.label}</span>
             </div>
-            <span className={`inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[11px] font-medium ${s.positive ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>
-              {s.positive ? <ArrowUpRight size={11} strokeWidth={2.5} /> : <ArrowDownRight size={11} strokeWidth={2.5} />}
-              {s.delta}
-            </span>
+            {s.delta && (
+              <span className={`inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[11px] font-medium ${s.positive ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>
+                {s.positive ? <ArrowUpRight size={11} strokeWidth={2.5} /> : <ArrowDownRight size={11} strokeWidth={2.5} />}
+                {s.delta}
+              </span>
+            )}
           </div>
           <div className="mt-3 text-[28px] font-semibold tracking-tight tabular-nums">{s.value}</div>
           <div className="mt-1 text-[12px] text-neutral-400">{s.sub}</div>
