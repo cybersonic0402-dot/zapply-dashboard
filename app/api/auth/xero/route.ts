@@ -5,7 +5,7 @@ import { createClient } from "@/lib/supabase/server";
 // Visit /api/auth/xero while logged in to connect your Xero organization.
 
 const XERO_SCOPES = [
-  "openid", "profile", "email", "offline_access",
+  "offline_access",
   "accounting.reports.read",
   "accounting.transactions",
   "accounting.settings",
