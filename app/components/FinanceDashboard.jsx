@@ -2591,10 +2591,8 @@ export default function FinanceDashboard({ user = null, liveData = null, connect
               <div className="space-y-1 px-2.5 text-[12px] text-neutral-500">
                 <div className="flex items-center justify-between"><span>Shopify Plus</span><StatusDot status={shopifyLive ? "ok" : "error"} /></div>
                 <div className="flex items-center justify-between"><span>Triple Whale</span><StatusDot status={twLive ? "ok" : "error"} /></div>
-                <div className="flex items-center justify-between">
-                  <span className="flex items-center gap-1.5">Jortt <span className="text-[9px] text-[#13B5EA] font-medium">â†’ Xero</span></span>
-                  <StatusDot status={jorttLive ? "ok" : "error"} />
-                </div>
+                <div className="flex items-center justify-between"><span>Jortt</span><StatusDot status={jorttLive ? "ok" : "error"} /></div>
+                <div className="flex items-center justify-between"><span>Xero</span><StatusDot status={xeroLive ? "ok" : "error"} /></div>
               </div>
             </div>
           </nav>
