@@ -1,6 +1,6 @@
 ﻿'use client';
 // @ts-nocheck
-import React, { useEffect, useState, useMemo, useCallback } from "react";
+import React, { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import SyncView from "./SyncView";
 import {
@@ -81,6 +81,266 @@ const formatValue = (value, format) => {
 
 const fmtCurrency = (n) => `€${Math.abs(n).toLocaleString()}`;
 const fmtSigned = (n) => (n >= 0 ? `+€${n.toLocaleString()}` : `-€${Math.abs(n).toLocaleString()}`);
+
+/* =========================================================================
+   DATE RANGE HELPERS
+   ========================================================================= */
+
+function drStartOfMonth(date = new Date()) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-01`;
+}
+function drToday() {
+  return new Date().toISOString().split("T")[0];
+}
+function drLastMonthStart() {
+  const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - 1);
+  return drStartOfMonth(d);
+}
+function drLastMonthEnd() {
+  const d = new Date(); d.setDate(0); // last day of previous month
+  return d.toISOString().split("T")[0];
+}
+function drMonthsAgo(n) {
+  const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - n);
+  return drStartOfMonth(d);
+}
+function drFormatLabel(from, to) {
+  const som = drStartOfMonth(), tod = drToday();
+  if (from === som && to === tod) return "This month";
+  if (from === drLastMonthStart() && to === drLastMonthEnd()) return "Last month";
+  const fmt = (s) => {
+    const d = new Date(s + "T12:00:00");
+    return d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "2-digit" });
+  };
+  return `${fmt(from)} – ${fmt(to)}`;
+}
+function monthInRange(monthKey, from, to) {
+  if (!monthKey) return false;
+  const d = new Date("1 " + monthKey.replace("'", "20"));
+  if (isNaN(d.getTime())) return false;
+  const ms = new Date(d.getFullYear(), d.getMonth(), 1);
+  const me = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+  return ms <= new Date(to + "T23:59:59") && me >= new Date(from + "T00:00:00");
+}
+
+/* =========================================================================
+   DATE RANGE PICKER — inline calendar
+   ========================================================================= */
+
+const CalendarPicker = ({ from, to, onSelect }) => {
+  const todayStr = drToday();
+  const initD    = from ? new Date(from + "T12:00:00") : new Date();
+  const [vy, setVy] = useState(initD.getFullYear());
+  const [vm, setVm] = useState(initD.getMonth());
+  const [anchor,  setAnchor]  = useState(null);
+  const [hovered, setHovered] = useState(null);
+
+  // Reset picking state when external from/to changes (preset applied)
+  useEffect(() => { setAnchor(null); setHovered(null); }, [from, to]);
+
+  // Calendar math helpers
+  const ds   = (y, m, d) => `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+  const dim  = (y, m)    => new Date(y, m + 1, 0).getDate();
+  const fdow = (y, m)    => { const d = new Date(y, m, 1).getDay(); return d === 0 ? 6 : d - 1; };
+
+  const prevMonth = () => { const d = new Date(vy, vm - 1, 1); setVy(d.getFullYear()); setVm(d.getMonth()); };
+  const nextMonth = () => {
+    const d = new Date(vy, vm + 1, 1);
+    if (ds(d.getFullYear(), d.getMonth(), 1) <= todayStr) { setVy(d.getFullYear()); setVm(d.getMonth()); }
+  };
+  const canNext = new Date(vy, vm + 1, 1) <= new Date();
+
+  const handleDay = (dateStr) => {
+    if (!anchor) {
+      setAnchor(dateStr);
+    } else {
+      const [s, e] = dateStr < anchor ? [dateStr, anchor] : [anchor, dateStr];
+      onSelect(s, e);
+      setAnchor(null); setHovered(null);
+    }
+  };
+
+  // Display range: while picking, preview anchor→hover; otherwise show committed from/to
+  const dFrom = anchor ? (hovered && hovered < anchor ? hovered : anchor) : from;
+  const dTo   = anchor ? (hovered && hovered > anchor ? hovered : anchor) : to;
+
+  const numDays = dim(vy, vm);
+  const offset  = fdow(vy, vm);
+  const monthLabel = new Date(vy, vm, 1).toLocaleDateString("en-US", { month: "long", year: "numeric" });
+  const DAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+  const cells = [...Array(offset).fill(null), ...Array.from({ length: numDays }, (_, i) => ds(vy, vm, i + 1))];
+
+  return (
+    <div className="select-none">
+      {/* Month navigation */}
+      <div className="mb-2 flex items-center justify-between px-0.5">
+        <button onClick={prevMonth} className="flex h-6 w-6 items-center justify-center rounded-md text-neutral-400 transition hover:bg-neutral-100">
+          <ChevronDown size={13} className="rotate-90" />
+        </button>
+        <span className="text-[12px] font-semibold text-neutral-800">{monthLabel}</span>
+        <button onClick={nextMonth} disabled={!canNext} className="flex h-6 w-6 items-center justify-center rounded-md text-neutral-400 transition hover:bg-neutral-100 disabled:opacity-25 disabled:cursor-default">
+          <ChevronDown size={13} className="-rotate-90" />
+        </button>
+      </div>
+
+      {/* Weekday headers */}
+      <div className="mb-0.5 grid grid-cols-7">
+        {DAYS.map(d => <div key={d} className="py-0.5 text-center text-[10px] font-medium text-neutral-400">{d}</div>)}
+      </div>
+
+      {/* Day cells */}
+      <div className="grid grid-cols-7">
+        {cells.map((dateStr, i) => {
+          if (!dateStr) return <div key={`_${i}`} className="h-8" />;
+
+          const future   = dateStr > todayStr;
+          const isToday  = dateStr === todayStr;
+          const isStart  = dateStr === dFrom;
+          const isEnd    = dateStr === dTo;
+          const inRange  = dFrom && dTo && dFrom !== dTo && dateStr > dFrom && dateStr < dTo;
+          const isEdge   = isStart || isEnd;
+          const bothEdge = isStart && isEnd;
+          const dayNum   = +dateStr.slice(8);
+
+          return (
+            <div
+              key={dateStr}
+              className={[
+                "relative flex h-8 items-center justify-center",
+                inRange                        ? "bg-neutral-100"    : "",
+                isStart && dTo && !bothEdge    ? "rounded-l-full"   : "",
+                isEnd   && dFrom && !bothEdge  ? "rounded-r-full"   : "",
+              ].join(" ")}
+            >
+              <button
+                onClick={() => !future && handleDay(dateStr)}
+                onMouseEnter={() => anchor && !future && setHovered(dateStr)}
+                onMouseLeave={() => anchor && setHovered(null)}
+                disabled={future}
+                className={[
+                  "flex h-7 w-7 items-center justify-center rounded-full text-[12px] font-medium transition",
+                  future   ? "cursor-default text-neutral-200"                             : "",
+                  isEdge   ? "bg-neutral-900 text-white"                                   : "",
+                  isToday && !isEdge ? "ring-1 ring-inset ring-neutral-400 text-neutral-700" : "",
+                  !isEdge && !future ? "text-neutral-700 hover:bg-neutral-200"             : "",
+                ].join(" ")}
+              >
+                {dayNum}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Hint line */}
+      <p className="mt-2 text-center text-[10px] text-neutral-400">
+        {anchor ? "Now click to select end date" : "Click a date to start selection"}
+      </p>
+    </div>
+  );
+};
+
+const DateRangePicker = ({ from, to, onApply, loading = false }) => {
+  const [open, setOpen]           = useState(false);
+  const [pendingFrom, setPendingFrom] = useState(from);
+  const [pendingTo,   setPendingTo]   = useState(to);
+  const ref = useRef(null);
+
+  // Keep pending in sync if parent resets committed range externally
+  useEffect(() => { setPendingFrom(from); setPendingTo(to); }, [from, to]);
+
+  useEffect(() => {
+    function outside(e) { if (ref.current && !ref.current.contains(e.target)) setOpen(false); }
+    document.addEventListener("mousedown", outside);
+    return () => document.removeEventListener("mousedown", outside);
+  }, []);
+
+  const PRESETS = [
+    { label: "This month",    from: drStartOfMonth(),  to: drToday() },
+    { label: "Last month",    from: drLastMonthStart(), to: drLastMonthEnd() },
+    { label: "Last 3 months", from: drMonthsAgo(3),     to: drToday() },
+    { label: "Last 6 months", from: drMonthsAgo(6),     to: drToday() },
+  ];
+
+  const handleApply = () => {
+    if (!pendingFrom || !pendingTo) return;
+    onApply(pendingFrom, pendingTo);
+    setOpen(false);
+  };
+
+  const pendingChanged = pendingFrom !== from || pendingTo !== to;
+
+  return (
+    <div className="relative" ref={ref}>
+      {/* Trigger button */}
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="flex items-center gap-1.5 rounded-lg border border-neutral-200 bg-white px-3 py-1.5 text-[12px] font-medium text-neutral-700 transition hover:bg-neutral-50 disabled:opacity-60"
+        disabled={loading}
+      >
+        {loading
+          ? <RefreshCw size={13} className="text-neutral-400 animate-spin" />
+          : <Calendar size={13} className="text-neutral-400" />
+        }
+        {drFormatLabel(from, to)}
+        <ChevronDown size={12} className={`text-neutral-400 transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+
+      {/* Dropdown */}
+      {open && (
+        <div className="absolute right-0 top-10 z-50 w-[268px] rounded-xl border border-neutral-200 bg-white p-3 shadow-xl shadow-neutral-200/60">
+          {/* Presets */}
+          <div className="mb-1 px-0.5 text-[10px] font-semibold uppercase tracking-wider text-neutral-400">Quick select</div>
+          <div className="mb-3 grid grid-cols-2 gap-1">
+            {PRESETS.map(p => (
+              <button
+                key={p.label}
+                onClick={() => { setPendingFrom(p.from); setPendingTo(p.to); }}
+                className={`rounded-md px-2 py-1.5 text-left text-[11px] font-medium transition ${
+                  p.from === pendingFrom && p.to === pendingTo
+                    ? "bg-neutral-900 text-white"
+                    : "text-neutral-600 hover:bg-neutral-100"
+                }`}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+
+          {/* Calendar */}
+          <div className="border-t border-neutral-100 pt-3">
+            <div className="mb-2 px-0.5 text-[10px] font-semibold uppercase tracking-wider text-neutral-400">Custom range</div>
+            <CalendarPicker
+              from={pendingFrom}
+              to={pendingTo}
+              onSelect={(f, t) => { setPendingFrom(f); setPendingTo(t); }}
+            />
+          </div>
+
+          {/* Pending range preview */}
+          {pendingFrom && pendingTo && (
+            <div className="mt-2 flex items-center justify-between rounded-md bg-neutral-50 px-2.5 py-1.5">
+              <span className="text-[11px] text-neutral-500">{drFormatLabel(pendingFrom, pendingTo)}</span>
+            </div>
+          )}
+
+          {/* Apply button */}
+          <button
+            onClick={handleApply}
+            disabled={!pendingFrom || !pendingTo}
+            className={`mt-2 w-full rounded-lg px-3 py-2 text-[12px] font-semibold transition ${
+              pendingChanged
+                ? "bg-neutral-900 text-white hover:bg-neutral-700"
+                : "bg-neutral-100 text-neutral-500 hover:bg-neutral-200"
+            }`}
+          >
+            {pendingChanged ? "Apply & sync" : "Apply"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
 
 /* =========================================================================
    SMALL UI COMPONENTS
@@ -210,24 +470,92 @@ const BrandIcon = ({ brand, size = 14, className = "" }) => {
    VIEW: OVERVIEW
    ========================================================================= */
 
-const OverviewView = ({ range, setRange, data = [], totals, liveMarkets = null, twData = [], subData = [] }) => {
-  const xAxisInterval = data.length > 0 ? Math.floor(data.length / 5) : 0;
+const OverviewView = ({ dateRange, onDateChange, liveMarkets = null, twData = [], subData = [], shopifyMonthly = null, jorttData = null, rangeData = null, rangeSyncing = false }) => {
   const [chartsReady, setChartsReady] = useState(false);
+  useEffect(() => { setChartsReady(true); }, []);
 
-  useEffect(() => {
-    setChartsReady(true);
-  }, []);
+  // When a custom-range sync has returned data, use it in place of the live props
+  const effectiveMarkets = rangeData?.shopifyMarkets ?? liveMarkets;
+  const effectiveTWData  = rangeData?.tripleWhale
+    ? rangeData.tripleWhale.filter(m => m.live)
+    : twData;
 
-  // Aggregate live metrics across all markets
-  const liveRevenueMTD  = liveMarkets?.filter(m => m.live).reduce((s, m) => s + (m.revenue ?? 0), 0) ?? null;
-  const liveOrdersMTD   = liveMarkets?.filter(m => m.live).reduce((s, m) => s + (m.orders ?? 0), 0) ?? null;
-  const liveAOV         = liveRevenueMTD && liveOrdersMTD ? liveRevenueMTD / liveOrdersMTD : null;
-  const liveTWNL        = twData?.find(t => t.market === "NL" && t.live);
-  const liveAdSpend     = twData?.filter(t => t.live).reduce((s, t) => s + (t.adSpend ?? 0), 0) || null;
-  const liveROAS        = liveTWNL?.roas ?? (liveAdSpend && liveRevenueMTD ? liveRevenueMTD / liveAdSpend : null);
-  const liveMER         = liveTWNL?.mer ?? null;
+  // Is the selected range the current month?
+  const isCurrentMonth = useMemo(() => {
+    if (rangeData) return false; // always treat synced custom-range data as historical
+    const som = drStartOfMonth(), tod = drToday();
+    return dateRange.from === som && dateRange.to === tod;
+  }, [dateRange, rangeData]);
+
+  // Shopify monthly rows that fall within the selected date range
+  const rangeShopifyMonths = useMemo(() =>
+    (shopifyMonthly ?? []).filter(m => monthInRange(m.month, dateRange.from, dateRange.to)),
+    [shopifyMonthly, dateRange]);
+
+  // Jortt months in range
+  const rangeJorttRevenue = useMemo(() => {
+    if (!jorttData?.revenueByMonth) return null;
+    const total = Object.entries(jorttData.revenueByMonth)
+      .filter(([mk]) => monthInRange(mk, dateRange.from, dateRange.to))
+      .reduce((s, [, v]) => s + v, 0);
+    return total > 0 ? total : null;
+  }, [jorttData, dateRange]);
+
+  const rangeJorttExpenses = useMemo(() => {
+    if (!jorttData?.expensesByMonth) return null;
+    const total = Object.entries(jorttData.expensesByMonth)
+      .filter(([mk]) => monthInRange(mk, dateRange.from, dateRange.to))
+      .reduce((s, [, v]) => s + v, 0);
+    return total > 0 ? total : null;
+  }, [jorttData, dateRange]);
+
+  // Revenue: rangeData (fresh sync) > current-month live > monthly cache > Jortt
+  const liveRevenueMTD  = effectiveMarkets?.filter(m => m.live).reduce((s, m) => s + (m.revenue ?? 0), 0) ?? null;
+  const liveOrdersMTD   = effectiveMarkets?.filter(m => m.live).reduce((s, m) => s + (m.orders ?? 0), 0) ?? null;
+  const rangeRevenue = rangeData
+    ? liveRevenueMTD   // effectiveMarkets is rangeData.shopifyMarkets — fresh Shopify data
+    : isCurrentMonth
+      ? liveRevenueMTD
+      : rangeShopifyMonths.length > 0
+        ? rangeShopifyMonths.reduce((s, m) => s + ((m.revenue ?? 0) - (m.refunds ?? 0)), 0)
+        : (rangeJorttRevenue ?? null);
+  const rangeOrders = rangeData
+    ? liveOrdersMTD
+    : isCurrentMonth
+      ? liveOrdersMTD
+      : rangeShopifyMonths.length > 0 ? rangeShopifyMonths.reduce((s, m) => s + (m.orders ?? 0), 0) : null;
+  const rangeAOV = rangeRevenue && rangeOrders ? rangeRevenue / rangeOrders : null;
+
+  // Revenue source label
+  const revenueSourceLabel = rangeData
+    ? `${drFormatLabel(dateRange.from, dateRange.to)} · all stores · synced`
+    : isCurrentMonth
+      ? "MTD · all stores · Shopify live"
+      : rangeShopifyMonths.length > 0
+        ? `${rangeShopifyMonths.length} month${rangeShopifyMonths.length > 1 ? "s" : ""} · Shopify NL · historical`
+        : rangeJorttRevenue ? "Jortt invoices · historical" : "No Shopify data for this range";
+
+  const liveAOV = isCurrentMonth ? (liveRevenueMTD && liveOrdersMTD ? liveRevenueMTD / liveOrdersMTD : null) : rangeAOV;
+  const liveTWNL        = effectiveTWData?.find(t => t.market === "NL" && t.live);
+  // Ad spend: NL only (EUR). Other markets use GBP/USD — summing currencies gives wrong totals.
+  const liveAdSpendNL   = liveTWNL?.adSpend ?? null;
+  const liveAdSpend     = liveAdSpendNL;   // shown as NL (EUR) ad spend
+  // ROAS: use TW NL's blended ROAS directly (it accounts for all channels for that store)
+  const liveROAS        = liveTWNL?.roas ?? null;
+  // MER: compute from TW NL's own revenue and ad spend to stay in one currency
+  const liveMER         = (liveTWNL?.revenue && liveTWNL?.adSpend && liveTWNL.adSpend > 0)
+    ? +(liveTWNL.revenue / liveTWNL.adSpend).toFixed(2)
+    : null;
   const liveNCPA        = liveTWNL?.ncpa ?? null;
   const liveLtvCpa      = liveTWNL?.ltvCpa ?? null;
+  // Real P&L from TW NL (these are real figures, not estimates)
+  const liveGrossProfit = liveTWNL?.grossProfit ?? null;
+  const liveCOGS        = liveTWNL?.cogs ?? null;
+  const liveNetProfit   = liveTWNL?.netProfit ?? null;
+  // Sum gross profit across all live TW markets that have it
+  const twTotalGrossProfit = effectiveTWData?.filter(t => t.live && t.grossProfit != null).reduce((s, t) => s + (t.grossProfit ?? 0), 0) || null;
+  const twTotalNetProfit   = effectiveTWData?.filter(t => t.live && t.netProfit   != null).reduce((s, t) => s + (t.netProfit   ?? 0), 0) || null;
+  const twTotalAdSpend     = effectiveTWData?.filter(t => t.live && t.adSpend     != null).reduce((s, t) => s + (t.adSpend     ?? 0), 0) || null;
   const liveLoop        = subData.find(s => s.market === "UK") ?? null;
   const liveJuo         = subData.find(s => s.market === "NL") ?? null;
   const liveMRR         = subData.length > 0 ? subData.reduce((s, m) => s + (m.mrr ?? 0), 0) : null;
@@ -240,17 +568,7 @@ const OverviewView = ({ range, setRange, data = [], totals, liveMarkets = null, 
           Live revenue from Shopify, ad performance from Triple Whale, reconciled nightly against Jortt.
         </p>
       </div>
-      <div className="flex items-center gap-2">
-        <div className="flex items-center gap-0.5 rounded-lg border border-neutral-200 bg-white p-0.5">
-          <Chip active={range === "7d"} onClick={() => setRange("7d")}>7D</Chip>
-          <Chip active={range === "30d"} onClick={() => setRange("30d")}>30D</Chip>
-          <Chip active={range === "90d"} onClick={() => setRange("90d")}>90D</Chip>
-        </div>
-        <button className="flex items-center gap-1.5 rounded-lg border border-neutral-200 bg-white px-3 py-1.5 text-[12px] font-medium text-neutral-700 hover:bg-neutral-50">
-          <Calendar size={13} />
-          Custom
-        </button>
-      </div>
+      <DateRangePicker from={dateRange.from} to={dateRange.to} onApply={onDateChange} loading={rangeSyncing} />
     </div>
 
     {/* Revenue hero */}
@@ -264,80 +582,111 @@ const OverviewView = ({ range, setRange, data = [], totals, liveMarkets = null, 
               <span className="text-[11px] text-neutral-400">· selected period</span>
             </div>
             <div className="mt-3 flex items-baseline gap-4">
-              {liveRevenueMTD !== null ? (
+              {rangeRevenue !== null ? (
                 <>
                   <span className="text-[44px] font-semibold tracking-tight tabular-nums leading-none">
-                    €{liveRevenueMTD.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                    €{Math.round(rangeRevenue).toLocaleString()}
                   </span>
-                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500"/>Live</span>
+                  {isCurrentMonth
+                    ? <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-medium text-emerald-700"><span className="h-1.5 w-1.5 rounded-full bg-emerald-500"/>Live</span>
+                    : <span className="inline-flex items-center gap-1 rounded-full bg-neutral-100 px-2 py-0.5 text-[10px] font-medium text-neutral-500">Historical</span>
+                  }
                 </>
               ) : (
                 <span className="text-[44px] font-semibold tracking-tight tabular-nums leading-none text-neutral-300">—</span>
               )}
             </div>
-            <div className="mt-1 text-[12px] text-neutral-400">{liveRevenueMTD ? "MTD · all stores · Shopify live" : "Shopify not connected"}</div>
+            <div className="mt-1 text-[12px] text-neutral-400">{rangeRevenue !== null ? revenueSourceLabel : "Shopify not connected"}</div>
           </div>
           <div className="hidden items-center gap-6 md:flex">
             <div className="text-right">
               <div className="text-[10px] font-medium uppercase tracking-wider text-neutral-400">Orders</div>
-              <div className="mt-0.5 text-[16px] font-semibold tabular-nums">{liveOrdersMTD !== null ? liveOrdersMTD.toLocaleString() : "—"}</div>
+              <div className="mt-0.5 text-[16px] font-semibold tabular-nums">{rangeOrders !== null ? rangeOrders.toLocaleString() : "—"}</div>
             </div>
             <div className="text-right">
               <div className="text-[10px] font-medium uppercase tracking-wider text-neutral-400">AOV</div>
-              <div className="mt-0.5 text-[16px] font-semibold tabular-nums">{liveAOV !== null ? `€${liveAOV.toFixed(2)}` : "—"}</div>
+              <div className="mt-0.5 text-[16px] font-semibold tabular-nums">{rangeAOV !== null ? `€${rangeAOV.toFixed(2)}` : liveAOV !== null ? `€${liveAOV.toFixed(2)}` : "—"}</div>
             </div>
           </div>
         </div>
       </Card>
     </section>
 
-    {/* Profit row — contribution margin, opex, EBITDA — only show if live data available */}
-    {liveRevenueMTD !== null && (
+    {/* Profit row — real TW figures (current month) or Jortt (historical) */}
+    {rangeRevenue !== null && (
     <section className="mt-3 grid grid-cols-3 gap-3">
-      {[
-        {
-          icon: Sparkles,
-          label: "Contribution margin",
-          value: `€${Math.round(liveRevenueMTD * 0.42).toLocaleString()}`,
-          delta: null,
-          positive: true,
-          sub: `~42% of revenue · est. pending Jortt/Xero OpEx`,
-        },
-        {
-          icon: Wallet,
-          label: "OpEx",
-          value: `€${Math.round(liveRevenueMTD * 0.18).toLocaleString()}`,
-          delta: null,
-          positive: false,
-          sub: `~18% of revenue · est. — enable Jortt purchase scope`,
-        },
-        {
-          icon: TrendingUp,
-          label: "EBITDA",
-          value: `€${Math.round(liveRevenueMTD * 0.25).toLocaleString()}`,
-          delta: null,
-          positive: true,
-          sub: `~25% margin · est. pending real OpEx data`,
-        },
-      ].map((s) => (
-        <Card key={s.label} className="p-5 transition hover:border-neutral-300">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 text-[13px] font-medium text-neutral-500">
-              <s.icon size={14} />
-              <span>{s.label}</span>
-            </div>
-            {s.delta && (
-              <span className={`inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[11px] font-medium ${s.positive ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>
-                {s.positive ? <ArrowUpRight size={11} strokeWidth={2.5} /> : <ArrowDownRight size={11} strokeWidth={2.5} />}
-                {s.delta}
-              </span>
-            )}
+      {(() => {
+        const rev = rangeRevenue ?? 0;
+        // For historical ranges, fall back to Jortt data
+        const grossP = isCurrentMonth ? twTotalGrossProfit : (rangeJorttRevenue && rangeJorttExpenses ? rangeJorttRevenue - rangeJorttExpenses : twTotalGrossProfit);
+        const costs  = isCurrentMonth ? liveCOGS : (rangeJorttExpenses ?? liveCOGS);
+        const netP   = isCurrentMonth ? twTotalNetProfit : (grossP != null ? grossP : twTotalNetProfit);
+        const src    = isCurrentMonth ? "Triple Whale" : (rangeJorttRevenue ? "Jortt · historical" : "Triple Whale (MTD)");
+        return [
+          {
+            icon: Sparkles,
+            label: "Gross profit",
+            value: grossP != null ? `€${Math.round(grossP).toLocaleString()}` : "—",
+            pct: grossP != null && rev > 0 ? `${((grossP / rev) * 100).toFixed(1)}% margin` : null,
+            sub: grossP != null ? src : "Connect Triple Whale",
+            live: grossP != null,
+          },
+          {
+            icon: Wallet,
+            label: isCurrentMonth ? "COGS" : "Expenses",
+            value: costs != null ? `€${Math.round(costs).toLocaleString()}` : "—",
+            pct: costs != null && rev > 0 ? `${((costs / rev) * 100).toFixed(1)}% of revenue` : null,
+            sub: costs != null ? src : "Connect Triple Whale",
+            live: costs != null,
+          },
+          {
+            icon: TrendingUp,
+            label: "Net profit",
+            value: netP != null ? `€${Math.round(netP).toLocaleString()}` : "—",
+            pct: netP != null && rev > 0 ? `${((netP / rev) * 100).toFixed(1)}% margin` : null,
+            sub: netP != null ? src : "Connect Triple Whale",
+            live: netP != null,
+          },
+        ];
+      })().map((s) => (
+        <Card key={s.label} className={`p-5 transition hover:border-neutral-300 ${!s.live ? "opacity-50" : ""}`}>
+          <div className="flex items-center gap-2 text-[13px] font-medium text-neutral-500">
+            <s.icon size={14} />
+            <span>{s.label}</span>
           </div>
           <div className="mt-3 text-[28px] font-semibold tracking-tight tabular-nums">{s.value}</div>
+          {s.pct && <div className="mt-0.5 text-[11px] font-medium text-neutral-500">{s.pct}</div>}
           <div className="mt-1 text-[12px] text-neutral-400">{s.sub}</div>
         </Card>
       ))}
     </section>
+    )}
+
+    {/* Syncing overlay */}
+    {rangeSyncing && (
+      <div className="mt-3 flex items-center gap-2 rounded-lg border border-blue-100 bg-blue-50 px-4 py-2.5 text-[12px] text-blue-700">
+        <RefreshCw size={13} className="shrink-0 animate-spin" />
+        Fetching data for selected period from Shopify &amp; Triple Whale…
+      </div>
+    )}
+
+    {/* Historical range notice for TW metrics */}
+    {!isCurrentMonth && !rangeData && !rangeSyncing && (
+      <div className="mt-3 flex items-center gap-2 rounded-lg border border-amber-100 bg-amber-50 px-4 py-2.5 text-[12px] text-amber-700">
+        <Info size={13} className="shrink-0" />
+        Triple Whale metrics show <strong>current month to date</strong>. Select a range and click <strong>Apply &amp; sync</strong> to load accurate data for any period.
+        {rangeJorttRevenue && (
+          <span className="ml-1">Jortt shows <strong>€{Math.round(rangeJorttRevenue).toLocaleString()}</strong> revenue for this range{rangeJorttExpenses ? ` · €${Math.round(rangeJorttExpenses).toLocaleString()} expenses` : ""}.</span>
+        )}
+      </div>
+    )}
+
+    {/* Synced-range confirmation banner */}
+    {rangeData && !rangeSyncing && (
+      <div className="mt-3 flex items-center gap-2 rounded-lg border border-emerald-100 bg-emerald-50 px-4 py-2.5 text-[12px] text-emerald-700">
+        <CircleCheck size={13} className="shrink-0" />
+        Showing Shopify &amp; Triple Whale data for <strong>{drFormatLabel(dateRange.from, dateRange.to)}</strong>. All metrics reflect this exact period.
+      </div>
     )}
 
     {/* Customer economics row */}
@@ -346,7 +695,7 @@ const OverviewView = ({ range, setRange, data = [], totals, liveMarkets = null, 
         <BrandIcon brand="triplewhale" size={12} />
         <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">Customer economics</span>
         <div className="h-px flex-1 bg-neutral-200" />
-        <span className="text-[10px] text-neutral-400">Triple Whale · per acquired customer</span>
+        <span className="text-[10px] text-neutral-400">Triple Whale · {isCurrentMonth ? "per acquired customer" : "current MTD only"}</span>
       </div>
       <div className="grid grid-cols-3 gap-3">
         {[
@@ -376,7 +725,7 @@ const OverviewView = ({ range, setRange, data = [], totals, liveMarkets = null, 
             value: liveMER !== null ? `${liveMER.toFixed(2)}×` : "—",
             delta: null,
             positive: true,
-            sub: liveMER !== null ? "Triple Whale · blended" : "Triple Whale not connected",
+            sub: liveMER !== null ? "Revenue ÷ ad spend · NL" : "Triple Whale not connected",
             icon: Sparkles,
             live: liveMER !== null,
           },
@@ -416,37 +765,49 @@ const OverviewView = ({ range, setRange, data = [], totals, liveMarkets = null, 
             icon: Target,
             label: "Ad spend",
             value: liveAdSpend !== null ? `€${Math.round(liveAdSpend).toLocaleString()}` : "—",
-            delta: "3.2%",
+            delta: null,
             positive: false,
-            sub: liveAdSpend !== null ? "Triple Whale · all markets live" : "Triple Whale not connected",
+            sub: liveAdSpend !== null ? "Triple Whale · NL store (EUR)" : "Triple Whale not connected",
             live: liveAdSpend !== null,
           },
           {
             icon: Activity,
             label: "Blended ROAS",
             value: liveROAS !== null ? `${liveROAS.toFixed(2)}x` : "—",
-            delta: "0.4x",
+            delta: null,
             positive: true,
-            sub: liveROAS !== null ? "Triple Whale blended" : "Triple Whale not connected",
+            sub: liveROAS !== null ? "Triple Whale · NL store" : "Triple Whale not connected",
             live: liveROAS !== null,
           },
         ].map((s) => (
           <Card key={s.label} className={`p-4 transition ${s.live ? 'hover:border-neutral-300' : 'opacity-60'}`}>
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2 text-[12px] font-medium text-neutral-500">
-                <s.icon size={13} />
-                <span>{s.label}</span>
-              </div>
-              <span className={`inline-flex items-center gap-0.5 rounded-md px-1.5 py-0.5 text-[10px] font-medium ${s.positive ? "bg-emerald-50 text-emerald-700" : "bg-rose-50 text-rose-700"}`}>
-                {s.positive ? <ArrowUpRight size={10} strokeWidth={2.5} /> : <ArrowDownRight size={10} strokeWidth={2.5} />}
-                {s.delta}
-              </span>
+            <div className="flex items-center gap-2 text-[12px] font-medium text-neutral-500">
+              <s.icon size={13} />
+              <span>{s.label}</span>
             </div>
             <div className="mt-2 text-[22px] font-semibold tracking-tight tabular-nums">{s.value}</div>
             <div className="mt-0.5 text-[11px] text-neutral-400">{s.sub}</div>
           </Card>
         ))}
       </div>
+      {/* Per-market ad spend breakdown — each in its own currency */}
+      {effectiveTWData.filter(t => t.live && t.adSpend != null).length > 0 && (
+        <div className="mt-3 rounded-lg border border-neutral-100 bg-neutral-50 p-3">
+          <div className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-neutral-400">Ad spend by market · own currency</div>
+          <div className="flex flex-wrap gap-4">
+            {effectiveTWData.filter(t => t.live && t.adSpend != null).map(t => {
+              const sym = t.market === "UK" ? "£" : t.market === "US" ? "$" : "€";
+              return (
+                <div key={t.market}>
+                  <span className="text-[11px] text-neutral-500">{t.flag} {t.market}</span>
+                  <span className="ml-1.5 text-[13px] font-semibold tabular-nums">{sym}{Math.round(t.adSpend).toLocaleString()}</span>
+                  {t.roas != null && <span className="ml-1 text-[11px] text-neutral-400">· {t.roas.toFixed(2)}x ROAS</span>}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </section>
 
     {/* Subscriptions — Juo (NL) + Loop (UK/US/EU) */}
@@ -1983,7 +2344,29 @@ const ForecastView = ({ jorttData = null, shopifyMonthly = null }) => {
 
 export default function FinanceDashboard({ user = null, liveData = null, connections = {}, syncedAt = null, dataIsStale = false, hasAnyData = false }) {
   const router = useRouter();
-  const [range, setRange] = useState("30d");
+  const [dateRange, setDateRange]   = useState({ from: drStartOfMonth(), to: drToday() });
+  const [rangeData, setRangeData]   = useState(null);
+  const [rangeSyncing, setRangeSyncing] = useState(false);
+
+  const handleDateChange = useCallback(async (from, to) => {
+    setDateRange({ from, to });
+    const isCurrentMonth = from === drStartOfMonth() && to === drToday();
+    if (isCurrentMonth) {
+      setRangeData(null); // use live data
+      return;
+    }
+    setRangeSyncing(true);
+    setRangeData(null);
+    try {
+      const res  = await fetch(`/api/sync?from=${from}&to=${to}`, { method: "POST" });
+      const json = await res.json();
+      setRangeData(json.rangeData ?? null);
+    } catch {
+      setRangeData(null);
+    } finally {
+      setRangeSyncing(false);
+    }
+  }, []);
   const [view, setView] = useState("overview");
   const [avatarFailed, setAvatarFailed] = useState(false);
   const [syncing, setSyncing] = useState(false);
@@ -2210,7 +2593,7 @@ export default function FinanceDashboard({ user = null, liveData = null, connect
             </div>
           </div>
 
-          {view === "overview" && <OverviewView range={range} setRange={setRange} liveMarkets={activeMarkets} twData={twData} subData={allSubData} />}
+          {view === "overview" && <OverviewView dateRange={dateRange} onDateChange={handleDateChange} liveMarkets={activeMarkets} twData={twData} subData={allSubData} shopifyMonthly={liveData?.shopifyMonthly} jorttData={liveData?.jortt} rangeData={rangeData} rangeSyncing={rangeSyncing} />}
           {view === "metrics" && <MetricsView twData={twData} />}
           {view === "daily" && (shopifyLive ? <DailyPnLView dailyData={shopifyToday} twData={twData} /> : <div className="rounded-lg border border-amber-200 bg-amber-50 p-6 text-center text-[13px] text-amber-800"><strong>Daily P&L</strong> requires Shopify data. <button onClick={() => setView("sync")} className="underline text-amber-700 hover:text-amber-900">Connect Shopify</button> to view.</div>)}
           {view === "markets" && (activeMarkets ? <MarketsView liveMarkets={activeMarkets} twData={twData} /> : <div className="rounded-lg border border-amber-200 bg-amber-50 p-6 text-center text-[13px] text-amber-800"><strong>Margin per Market</strong> requires Shopify & Triple Whale data. <button onClick={() => setView("sync")} className="underline text-amber-700 hover:text-amber-900">Connect sources</button> to view.</div>)}

@@ -19,8 +19,29 @@ export async function POST(request: Request) {
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   const { searchParams } = new URL(request.url);
-  const source = searchParams.get("source") ?? "all";
+  const source  = searchParams.get("source") ?? "all";
+  const fromDate = searchParams.get("from") ?? undefined;
+  const toDate   = searchParams.get("to")   ?? undefined;
+  const isCustomRange = !!(fromDate && toDate);
 
+  // Custom date range: fetch only Shopify + TW for that period, return without overwriting cache
+  if (isCustomRange) {
+    const [shopifyMarkets, tripleWhale] = await Promise.allSettled([
+      fetchShopifyMarkets(fromDate, toDate),
+      fetchTripleWhale(fromDate, toDate),
+    ]);
+    return NextResponse.json({
+      ok: true,
+      from: fromDate,
+      to: toDate,
+      rangeData: {
+        shopifyMarkets: shopifyMarkets.status === "fulfilled" ? shopifyMarkets.value : null,
+        tripleWhale:    tripleWhale.status    === "fulfilled" ? tripleWhale.value    : null,
+      },
+    });
+  }
+
+  // Full sync — fetch all sources and cache
   const results: Record<string, string> = {};
 
   async function run(name: string, fn: () => Promise<any>, provider: string, key: string) {
@@ -35,8 +56,6 @@ export async function POST(request: Request) {
     }
   }
 
-  // All 7 sources run fully concurrently — each handles its own rate limiting internally.
-  // Juo and Loop have separate API keys from Shopify/TW/Jortt, so no shared rate limits.
   await Promise.all([
     run("shopify_markets", fetchShopifyMarkets, "shopify",     "markets"),
     run("shopify_monthly", fetchShopifyMonthly, "shopify",     "monthly"),

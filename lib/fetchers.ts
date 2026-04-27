@@ -105,8 +105,8 @@ async function getShopifyToken(store: string): Promise<string | null> {
 }
 
 // Paginated GQL — one page, with optional cursor for subsequent pages
-const SHOPIFY_GQL_PAGE = (since: string, cursor: string | null) => `{
-  orders(first:250, ${cursor ? `after:"${cursor}",` : ""}query:"created_at:>=${since} financial_status:paid") {
+const SHOPIFY_GQL_PAGE = (since: string, cursor: string | null, until?: string | null) => `{
+  orders(first:250, ${cursor ? `after:"${cursor}",` : ""}query:"created_at:>=${since}${until ? ` created_at:<=${until}` : ""} financial_status:paid") {
     pageInfo { hasNextPage endCursor }
     edges { node {
       totalPriceSet    { shopMoney { amount currencyCode } }
@@ -119,7 +119,7 @@ const SHOPIFY_GQL_PAGE = (since: string, cursor: string | null) => `{
 }`;
 
 // Aggregate all orders for a store using cursor pagination (max 40 pages = 10,000 orders)
-async function fetchShopifyAllOrders(store: string, token: string, since: string, maxPages = 40) {
+async function fetchShopifyAllOrders(store: string, token: string, since: string, maxPages = 40, until?: string | null) {
   let revenue = 0, refunds = 0, discounts = 0, orderCount = 0, currency = "EUR";
   const customerIds = new Set<string>();
   const monthlySums: Record<string, { revenue: number; orders: number; refunds: number }> = {};
@@ -131,7 +131,7 @@ async function fetchShopifyAllOrders(store: string, token: string, since: string
     const res: Response = await fetch(`https://${store}/admin/api/2025-01/graphql.json`, {
       method: "POST",
       headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" },
-      body: JSON.stringify({ query: SHOPIFY_GQL_PAGE(since, cursor) }),
+      body: JSON.stringify({ query: SHOPIFY_GQL_PAGE(since, cursor, until) }),
     });
     if (!res.ok) break;
     const json = await res.json();
@@ -161,11 +161,12 @@ async function fetchShopifyAllOrders(store: string, token: string, since: string
   return { revenue, refunds, discounts, orderCount, currency, uniqueCustomers: customerIds.size, monthlySums, truncated: hasNextPage };
 }
 
-export async function fetchShopifyMarkets() {
+export async function fetchShopifyMarkets(fromDate?: string, toDate?: string) {
   const clientId = process.env.SHOPIFY_APP_CLIENT_ID;
   if (!clientId) return null;
 
-  const since = `${startOfMonth()}T00:00:00Z`;
+  const since = `${fromDate ?? startOfMonth()}T00:00:00Z`;
+  const until = toDate ? `${toDate}T23:59:59Z` : null; // passed into GQL query filter
 
   const results = await Promise.all(
     SHOPIFY_STORES.map(async ({ code, flag, name, storeKey, status }: any) => {
@@ -176,7 +177,7 @@ export async function fetchShopifyMarkets() {
       if (!token) return { code, flag, name, status: status ?? null, live: false };
 
       try {
-        const agg = await fetchShopifyAllOrders(store, token, since);
+        const agg = await fetchShopifyAllOrders(store, token, since, 40, until);
         const { revenue, refunds, discounts, orderCount, currency, uniqueCustomers, truncated } = agg;
         const aov = orderCount > 0 ? revenue / orderCount : 0;
         if (truncated) console.warn(`Shopify ${code}: revenue capped at 40 pages (10,000 orders)`);
@@ -303,12 +304,12 @@ function twMetric(metrics: any[], id: string): number | null {
   return toNumber(m?.values?.current);
 }
 
-export async function fetchTripleWhale() {
+export async function fetchTripleWhale(fromDate?: string, toDate?: string) {
   const apiKey = process.env.TRIPLE_WHALE_API_KEY;
   if (!apiKey) return null;
 
-  const start = startOfMonth();
-  const end   = today();
+  const start = fromDate ?? startOfMonth();
+  const end   = toDate   ?? today();
 
   const results = await Promise.all(
     TW_SHOPS.map(async ({ market, flag, envKeys }: any) => {
