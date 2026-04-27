@@ -4,12 +4,7 @@ import { createClient } from "@/lib/supabase/server";
 // Initiates the Xero OAuth 2.0 Authorization Code flow.
 // Visit /api/auth/xero while logged in to connect your Xero organization.
 
-const XERO_SCOPES = [
-  "offline_access",
-  "accounting.reports.read",
-  "accounting.transactions",
-  "accounting.settings",
-].join(" ");
+const XERO_SCOPES = "offline_access accounting.invoices openid profile email accounting.contacts accounting.settings";
 
 export async function GET(request: Request) {
   const supabase = await createClient();
@@ -34,6 +29,9 @@ export async function GET(request: Request) {
   });
 
   const authUrl = `https://login.xero.com/identity/connect/authorize?${params}`;
+  console.log("[Xero OAuth] redirect_uri:", redirectUri);
+  console.log("[Xero OAuth] scopes:", XERO_SCOPES);
+  console.log("[Xero OAuth] full auth URL:", authUrl);
 
   const res = NextResponse.redirect(authUrl);
   res.cookies.set("xero_state", state, { httpOnly: true, maxAge: 600, path: "/" });
