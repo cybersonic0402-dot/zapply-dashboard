@@ -9,6 +9,7 @@ import {
   fetchJortt,
   fetchJuoRaw,
   fetchLoopRaw,
+  fetchXero,
 } from "@/lib/fetchers";
 
 export const maxDuration = 300;
@@ -64,6 +65,7 @@ export async function POST(request: Request) {
     run("jortt",           fetchJortt,          "jortt",       "invoices"),
     run("juo",             fetchJuoRaw,         "juo",         "subscriptions"),
     run("loop",            fetchLoopRaw,        "loop",        "subscriptions"),
+    run("xero",            fetchXero,           "xero",        "accounting"),
   ]);
 
   return NextResponse.json({ ok: true, syncedAt: new Date().toISOString(), results });

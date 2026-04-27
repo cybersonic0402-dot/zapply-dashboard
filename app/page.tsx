@@ -19,6 +19,7 @@ async function getConnections() {
   if (process.env.LOOP_UK_API_KEY || process.env.LOOP_US_API_KEY || process.env.LOOP_EU_API_KEY)
                                           connections["loop"]        = "connected";
   if (process.env.TRIPLE_WHALE_API_KEY)  connections["triplewhale"] = "connected";
+  // Xero status depends on OAuth being done — checked below after supabase is available
   return connections;
 }
 
@@ -27,11 +28,18 @@ export default async function Home() {
 
   // getUser() validates the JWT server-side (required by Supabase security guidelines).
   // Run it concurrently with the cache read so the auth check doesn't add serial latency.
-  const [[{ data: { user } }, cache], connections] = await Promise.all([
-    Promise.all([supabase.auth.getUser(), readAllCache()]),
+  const [[{ data: { user } }, cache, xeroRow], connections] = await Promise.all([
+    Promise.all([
+      supabase.auth.getUser(),
+      readAllCache(),
+      process.env.XERO_CLIENT_ID
+        ? supabase.from("integrations").select("provider").eq("provider", "xero").maybeSingle().then(r => r.data)
+        : Promise.resolve(null),
+    ]),
     getConnections(),
   ]);
   if (!user) redirect("/login");
+  if (xeroRow) connections["xero"] = "connected";
 
   const get = (provider: string, key: string) => cache[`${provider}/${key}`] ?? null;
 
@@ -42,6 +50,7 @@ export default async function Home() {
   const juoCache            = get("juo",         "subscriptions");
   const loopCache           = get("loop",        "subscriptions");
   const jorttCache          = get("jortt",       "invoices");
+  const xeroCache           = get("xero",        "accounting");
 
   // Oldest sync time across the main slow sources
   const syncTimes = [shopifyMarketsCache, tripleWhaleCache, juoCache, loopCache]
@@ -73,6 +82,7 @@ export default async function Home() {
         juo:            juoCache?.payload            ?? null,
         loop:           loopCache?.payload           ?? null,
         jortt:          jorttCache?.payload          ?? null,
+        xero:           xeroCache?.payload           ?? null,
       }}
       syncedAt={oldestSyncedAt}
       dataIsStale={dataIsStale}
