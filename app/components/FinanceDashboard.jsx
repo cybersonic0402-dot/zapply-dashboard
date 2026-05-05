@@ -597,6 +597,9 @@ const OverviewView = ({ dateRange, onDateChange, liveMarkets = null, twData = []
               )}
             </div>
             <div className="mt-1 text-[12px] text-neutral-400">{rangeRevenue !== null ? revenueSourceLabel : "Shopify not connected"}</div>
+            {effectiveMarkets?.some(m => m.live && (m.market === "UK" || m.market === "US")) && (
+              <div className="mt-1 text-[11px] text-amber-600">* UK in £ · US in $ · total is mixed-currency</div>
+            )}
           </div>
           <div className="hidden items-center gap-6 md:flex">
             <div className="text-right">
@@ -609,6 +612,47 @@ const OverviewView = ({ dateRange, onDateChange, liveMarkets = null, twData = []
             </div>
           </div>
         </div>
+
+        {/* Store breakdown */}
+        {effectiveMarkets && effectiveMarkets.filter(m => m.live).length > 0 && (() => {
+          const liveStores = effectiveMarkets.filter(m => m.live);
+          const total = liveStores.reduce((s, m) => s + (m.revenue ?? 0), 0);
+          const storeMap = {
+            NL: { label: "Shopify NL", flag: "🇳🇱", currency: "€" },
+            UK: { label: "Shopify UK", flag: "🇬🇧", currency: "£" },
+            US: { label: "Shopify US", flag: "🇺🇸", currency: "$" },
+            EU: { label: "Shopify EU", flag: "🇩🇪", currency: "€" },
+          };
+          return (
+            <div className="mt-4 border-t border-neutral-100 pt-4">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                {liveStores.map((m, i) => {
+                  const info = storeMap[m.market] ?? { label: m.market ?? "Store", flag: "🏪", currency: "€" };
+                  const pct = total > 0 ? ((m.revenue ?? 0) / total * 100) : 0;
+                  return (
+                    <div key={m.market ?? i} className="rounded-lg bg-neutral-50 px-3 py-2.5">
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className="text-[11px] font-medium text-neutral-500 flex items-center gap-1">
+                          <span>{info.flag}</span> {info.label}
+                        </span>
+                        <span className="text-[10px] text-neutral-400">{pct.toFixed(1)}%</span>
+                      </div>
+                      <div className="text-[15px] font-semibold tabular-nums">
+                        {info.currency}{Math.round(m.revenue ?? 0).toLocaleString()}
+                      </div>
+                      <div className="mt-1 h-1 w-full rounded-full bg-neutral-200">
+                        <div className="h-1 rounded-full bg-[#95BF47]" style={{ width: `${pct}%` }} />
+                      </div>
+                      <div className="mt-1 text-[10px] text-neutral-400">
+                        {(m.orders ?? 0).toLocaleString()} orders
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
       </Card>
     </section>
 
@@ -617,11 +661,23 @@ const OverviewView = ({ dateRange, onDateChange, liveMarkets = null, twData = []
     <section className="mt-3 grid grid-cols-3 gap-3">
       {(() => {
         const rev = rangeRevenue ?? 0;
-        // For historical ranges, fall back to Jortt data
-        const grossP = isCurrentMonth ? twTotalGrossProfit : (rangeJorttRevenue && rangeJorttExpenses ? rangeJorttRevenue - rangeJorttExpenses : twTotalGrossProfit);
-        const costs  = isCurrentMonth ? liveCOGS : (rangeJorttExpenses ?? liveCOGS);
-        const netP   = isCurrentMonth ? twTotalNetProfit : (grossP != null ? grossP : twTotalNetProfit);
-        const src    = isCurrentMonth ? "Triple Whale" : (rangeJorttRevenue ? "Jortt · historical" : "Triple Whale (MTD)");
+        // rangeData = fresh sync → TW range figures are accurate; else fall back to Jortt or TW MTD
+        const grossP = rangeData
+          ? twTotalGrossProfit
+          : isCurrentMonth
+            ? twTotalGrossProfit
+            : (rangeJorttRevenue && rangeJorttExpenses ? rangeJorttRevenue - rangeJorttExpenses : twTotalGrossProfit);
+        const costs  = rangeData
+          ? (effectiveTWData?.filter(t => t.live && t.cogs != null).reduce((s, t) => s + (t.cogs ?? 0), 0) || liveCOGS)
+          : isCurrentMonth ? liveCOGS : (rangeJorttExpenses ?? liveCOGS);
+        const netP   = rangeData
+          ? twTotalNetProfit
+          : isCurrentMonth
+            ? twTotalNetProfit
+            : (twTotalNetProfit ?? grossP);
+        const src    = rangeData
+          ? `Triple Whale · ${drFormatLabel(dateRange.from, dateRange.to)}`
+          : isCurrentMonth ? "Triple Whale" : (rangeJorttRevenue ? "Jortt · historical" : "Triple Whale (MTD)");
         return [
           {
             icon: Sparkles,
